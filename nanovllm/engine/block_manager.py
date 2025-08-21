@@ -49,7 +49,7 @@ class BlockManager:
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
-    def _deallocate_block(self, block_id: int) -> Block:
+    def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
@@ -58,19 +58,19 @@ class BlockManager:
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
-        assert not seq.block_table
+        assert not seq.block_table # seq只能被allocate1次
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1  # 只有满的block才计算hash
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
-            if cache_miss:
+            if cache_miss:  # 缓存未命中，分配一个空闲block
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
-            else:
+            else:  # 缓存命中，直接复用已有block
                 seq.num_cached_tokens += self.block_size
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
@@ -104,7 +104,7 @@ class BlockManager:
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
+            token_ids = seq.block(seq.num_blocks - 1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
