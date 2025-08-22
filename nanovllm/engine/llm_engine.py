@@ -57,11 +57,11 @@ class LLMEngine:
         return self.scheduler.is_finished()
 
     def generate(
-        self,
-        prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | list[SamplingParams],
-        use_tqdm: bool = True,
-    ) -> list[str]:
+            self,
+            prompts: list[str] | list[list[int]],
+            sampling_params: SamplingParams | list[SamplingParams],
+            use_tqdm: bool = True,
+    ) -> list[dict]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
@@ -87,7 +87,7 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs)]
-        outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        res = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
-        return outputs
+        return res

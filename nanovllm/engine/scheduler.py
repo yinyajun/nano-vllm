@@ -21,6 +21,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    # 如果有waiting就走prefill，然后尝试走decode
     def schedule(self) -> tuple[list[Sequence], bool]:
         # prefill
         scheduled_seqs = []
