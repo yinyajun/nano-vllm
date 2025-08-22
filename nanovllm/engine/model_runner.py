@@ -33,10 +33,10 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+        self.warmup_model()  # 会跑一次最大形状的前向，让 cuDNN/CUDA 等完成选择/初始化。
+        self.allocate_kv_cache()  # 根据显存余量计算能放下多少 KV blocks，并把缓存切片直接挂到每层模块的 k_cache/v_cache 上。
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            self.capture_cudagraph()  # 预先用不同 batch size 桶捕获多份 decode 前向的 CUDA Graph，后续重复回放。
         # -----------------------------------------
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -91,7 +91,7 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
-    def warmup_model(self):
+    def warmup_model(self): # 重置峰值统计，便于后面做 KV Cache 预算。
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
@@ -104,23 +104,27 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        used = total - free  # cuda ctx + torch + 其他程序
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]  # PyTorch 分配器 从进程启动到目前为止的 峰值 使用量
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]  # PyTorch 当前真正在用 的显存（所有活着的 tensor + 少量簿记开销）
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # 2 * L * block_size * num_kv_heads * head_dim * dtyp_size  k和v
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        # (total * a - used - (peak - current)) // block_size
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # [2, L, num_blocks, block_size, num_kv_heads, head_dim]
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size,
                                     num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
+                module.k_cache = self.kv_cache[0, layer_id] # [num_blocks, block_size, num_kv_heads, head_dim]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, seqs: list[Sequence]): # 对齐成相同长度的二维表（缺省填 -1），转到 GPU
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -141,12 +145,14 @@ class ModelRunner:
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # 前缀和
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
+
+            # slot_mapping: 在整个block_table中的绝对地址
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -219,6 +225,8 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # prefill 由于形状高度可变、不易稳定捕获，直接 eager 前向。
+
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -229,7 +237,7 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))  # 预先创建一套桶化的 batch size
         self.graphs = {}
         self.graph_pool = None
 
@@ -238,7 +246,7 @@ class ModelRunner:
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
                         block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
+            with torch.cuda.graph(graph, self.graph_pool):  # 捕获前向
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
