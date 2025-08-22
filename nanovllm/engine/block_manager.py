@@ -55,19 +55,21 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks  # 最多需要这么多block，有的block可能能复用已有的
+        return len(self.free_block_ids) >= seq.num_blocks  # 最坏情况才需要这么多（复用的block不需要新开）
 
+    # Prefill阶段，批量分配，初始化
+    # 将整条seq切分为若干个block，依次分配（复用或新开）
     def allocate(self, seq: Sequence):
         assert not seq.block_table  # seq只能被allocate1次
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1  # 只有满的block才计算hash
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1  # 只有填满的block才计算hash
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
-            if cache_miss:  # 缓存未命中，分配一个空闲block
+            if cache_miss:  # 缓存未命中，新开一个空闲block
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:  # 缓存命中，直接复用已有block
@@ -92,17 +94,19 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)  # 当seq多出一个token时候，新增一个block
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)  # 刚好跨过了block_size边界，才能新增一个block
 
+    # Decoder阶段，增量维护
+    # len(seq)不断增长，维护block_table和hash表
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:  # 当seq多出一个token时候，新增一个block
+        if len(seq) % self.block_size == 1:  # 刚好跨过了block_size边界
             assert last_block.hash != -1
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:  # 当seq正好能填充完所有block
+        elif len(seq) % self.block_size == 0:  # 刚好填满一个block，就要更新该block的hash
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks - 1)
             prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
