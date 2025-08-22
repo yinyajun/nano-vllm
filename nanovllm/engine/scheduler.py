@@ -26,7 +26,7 @@ class Scheduler:
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
+        while self.waiting and num_seqs < self.max_num_seqs: # 控制并发
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
@@ -41,9 +41,9 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
-        while self.running and num_seqs < self.max_num_seqs:
+        while self.running and num_seqs < self.max_num_seqs: # 控制并发
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq): # 无法追加新的block就去running中抢占
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
