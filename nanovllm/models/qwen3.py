@@ -27,12 +27,15 @@ class Qwen3Attention(nn.Module):
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
-        self.total_num_heads = num_heads
+
+        self.total_num_heads = num_heads  # q头
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
+
+        self.total_num_kv_heads = num_kv_heads  # kv头
         assert self.total_num_kv_heads % tp_size == 0
         self.num_kv_heads = self.total_num_kv_heads // tp_size
+
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -71,14 +74,19 @@ class Qwen3Attention(nn.Module):
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states) # [-1, q_size + 2 * kv_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        # 对 Q/K 做 RMSNorm，可以让每个 head 的激活量纲一致，避免“强头”过分影响注意力分布。
+        # 这样 Q 与 K/V 的交互主要取决于 方向（语义差异），而不是大小（尺度偏移）。
         q_by_head = q.view(-1, self.num_heads, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
         q = q_by_head.view(q.shape)
+
         k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
+
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o)
@@ -195,7 +203,7 @@ class Qwen3Model(nn.Module):
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states  # [B, L, d]
+        return hidden_states  # [B, L, d]?
 
 
 class Qwen3ForCausalLM(nn.Module):
