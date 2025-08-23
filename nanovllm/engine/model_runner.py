@@ -87,11 +87,11 @@ class ModelRunner:
 
     def call(self, method_name, *args):
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            self.write_shm(method_name, *args)  # shm来当rpc用
         method = getattr(self, method_name, None)
         return method(*args)
 
-    def warmup_model(self): # 重置峰值统计，便于后面做 KV Cache 预算。
+    def warmup_model(self):  # 重置峰值统计，便于后面做 KV Cache 预算。
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
@@ -120,11 +120,13 @@ class ModelRunner:
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id] # [num_blocks, block_size, num_kv_heads, head_dim]
+                module.k_cache = self.kv_cache[0, layer_id]  # [num_blocks, block_size, num_kv_heads, head_dim]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]): # 对齐成相同长度的二维表（缺省填 -1），转到 GPU
+    def prepare_block_tables(self, seqs: list[Sequence]):
+        # 对齐成相同长度的二维表（缺省填 -1），转到 GPU
+        # [B, max_blocks]
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -145,14 +147,14 @@ class ModelRunner:
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q) # 前缀和
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)  # 前缀和
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:
                 continue
 
-            # slot_mapping: 在整个block_table中的绝对地址
+            # slot_mapping: 对“尚未缓存”的块，按 block_table[i]*block_size + offset 计算精确写入地址。
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -160,8 +162,11 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens
                 slot_mapping.extend(list(range(start, end)))
+
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
+            # 当有prefix cache时候，新的q会短很多，而kv必须覆盖 旧+新，block table提供了旧的kv在哪个block的信息
             block_tables = self.prepare_block_tables(seqs)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -175,11 +180,13 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -197,16 +204,19 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        # prefill, eager或者 batch> 512(未capture) 的时候，普通前向
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            # 在model内部的layer前向过程中用到了get_context
             return self.model.compute_logits(self.model(input_ids, positions))
-        else:
+        else:  # 走Cuda graph replay
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]  # 找到刚好大于等于bs的graph_bs
             graph_vars = self.graph_vars
             for k, v in graph_vars.items():
                 if k != "outputs":
                     v.zero_()
+            #
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
@@ -216,6 +226,7 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # 仅rank0 sample
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
@@ -223,35 +234,46 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    # Capture不同batch size的cuda graph，推理时候直接用graph，减少kernel launch overhead
     @torch.inference_mode()
     def capture_cudagraph(self):
+        # https://zhuanlan.zhihu.com/p/715863693
+        # https://zhuanlan.zhihu.com/p/700224642
         # prefill 由于形状高度可变、不易稳定捕获，直接 eager 前向。
-
+        # 1. capture之前，先让warmup跑一次，触发库资源的初始化
+        # 2. capture的过程中，模型不会真正执行，而是生成一个静态图
+        # 3. 计算图不支持动态shape
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        # CUDA Graph 回放（replay）成功的两个硬性前提：捕获期与回放期在内存地址和张量形状/布局上必须一致。
+        # 所以要预分配这些buffer
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))  # 预先创建一套桶化的 batch size
         self.graphs = {}
         self.graph_pool = None
 
-        for bs in reversed(self.graph_bs):
+        for bs in reversed(self.graph_bs):  # 先用大的batch捕获，分配最大的pool，之后的小batch可以共享这块pool
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
                         block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # warmup
+            # graph.enable_debug_mode()
             with torch.cuda.graph(graph, self.graph_pool):  # 捕获前向
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])  # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
+            # graph.debug_dump("graph.dot")
             reset_context()
 
         self.graph_vars = dict(
