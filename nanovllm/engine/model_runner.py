@@ -86,6 +86,9 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        # 用 Python pickle + 共享内存 + 事件唤醒，开销极低，也不占用 NCCL 通道
+        # 在多 GPU 分布式训练/推理时，通常会用 NCCL 来做张量的同步（如 all-reduce、broadcast 等）。
+        # 这些操作走的通道本质上是 GPU-GPU 之间的高带宽通信路径。
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)  # shm来当rpc用
         method = getattr(self, method_name, None)

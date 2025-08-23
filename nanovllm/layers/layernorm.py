@@ -14,7 +14,7 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    @torch.compile
+    @torch.compile # 小而频繁、图稳定、维度固定的模块
     def rms_forward(
         self,
         x: torch.Tensor,
@@ -26,12 +26,13 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
-    @torch.compile
+    @torch.compile #小而频繁、图稳定、维度固定的模块
     def add_rms_forward(
         self,
         x: torch.Tensor,
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # qwen3是pre-norm方案
         orig_dtype = x.dtype
         x = x.to(torch.float32).add_(residual.to(torch.float32))
         residual = x.to(orig_dtype)

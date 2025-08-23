@@ -14,16 +14,16 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 class Qwen3Attention(nn.Module):
 
     def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        max_position: int = 4096 * 32,
-        head_dim: int | None = None,
-        rms_norm_eps: float = 1e-06,
-        qkv_bias: bool = False,
-        rope_theta: float = 10000,
-        rope_scaling: tuple | None = None,
+            self,
+            hidden_size: int,
+            num_heads: int,
+            num_kv_heads: int,
+            max_position: int = 4096 * 32,
+            head_dim: int | None = None,
+            rms_norm_eps: float = 1e-06,
+            qkv_bias: bool = False,
+            rope_theta: float = 10000,
+            rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -36,7 +36,7 @@ class Qwen3Attention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -67,9 +67,9 @@ class Qwen3Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -88,17 +88,17 @@ class Qwen3Attention(nn.Module):
 class Qwen3MLP(nn.Module):
 
     def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
+            self,
+            hidden_size: int,
+            intermediate_size: int,
+            hidden_act: str,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
-        )
+        )  # [W_gate, W_up]
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -108,8 +108,8 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        gate_up = self.gate_up_proj(x)  # [x * W_gate, x * W_up]
+        x = self.act_fn(gate_up)  # SwiGLU = silu(x * W_gate) \odot (x * W_up)
         x = self.down_proj(x)
         return x
 
@@ -117,8 +117,8 @@ class Qwen3MLP(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
-        self,
-        config: Qwen3Config,
+            self,
+            config: Qwen3Config,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -141,16 +141,33 @@ class Qwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+            self,
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # qwen3是pre-norm
+        # --------------------------
+        # 1. y = x + Attention(norm(x))
+        # 2. z = y + MLP(norm(y))
+        # --------------------------
+        # 这里的写法看起来像是post-norm，区分更应该看每层输出有没有norm
+        # --------------------------
+        # 1. x1, res = Attention(norm(x1)), x1
+        # 2. x1, res = norm(x1 + res), x1 + res
+        # 3. x2, res = MLP(x1), res
+        # --------------------------
+        # 1. x2, res = Attention(norm(x2) + res), norm(x2) + res
+        # 2. x2, res = norm(x2 + res), x2 + res
+        # 3. x3, res = MLP(x2), res
+        # --------------------------
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -160,8 +177,8 @@ class Qwen3DecoderLayer(nn.Module):
 class Qwen3Model(nn.Module):
 
     def __init__(
-        self,
-        config: Qwen3Config,
+            self,
+            config: Qwen3Config,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
@@ -169,16 +186,16 @@ class Qwen3Model(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states  # [B, L, d]
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -191,8 +208,8 @@ class Qwen3ForCausalLM(nn.Module):
     }
 
     def __init__(
-        self,
-        config: Qwen3Config
+            self,
+            config: Qwen3Config
     ) -> None:
         super().__init__()
         self.model = Qwen3Model(config)
@@ -201,16 +218,16 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions)
         return hidden_states
 
     def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
+            self,
+            hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         logits = self.lm_head(hidden_states)
         return logits
