@@ -4,64 +4,69 @@ from torch import nn
 
 
 def apply_rotary_emb(
-    x: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
 ) -> torch.Tensor:
-    cos = cos.unsqueeze(-2)
-    sin = sin.unsqueeze(-2)
-    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)
+    cos = cos.unsqueeze(-2)  # [T, 1, d_model//2]
+    sin = sin.unsqueeze(-2)  # [T, 1, d_model//2]
+
+    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)  # [T, -1, d_model//2]
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+    return torch.cat((y1, y2), dim=-1).to(x.dtype)  # [T, 1, d_model]
 
 
 class RotaryEmbedding(nn.Module):
 
     def __init__(
-        self,
-        head_size: int,
-        rotary_dim: int,
-        max_position_embeddings: int,
-        base: float,
+            self,
+            head_size: int,
+            rotary_dim: int,
+            max_position_embeddings: int,
+            base: float,
     ) -> None:
         super().__init__()
         self.head_size = head_size
         assert rotary_dim == head_size
-        inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+        f = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
+        angles = torch.einsum("i,j -> ij", t, f)  # torch.outer(t, f) [max_len, d_model//2]
+
+        cos = angles.cos()
+        sin = angles.sin()
+        cache = torch.cat((cos, sin), dim=-1)  # [max_len, d_model]
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     @torch.compile
     def forward(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
+            self,
+            positions: torch.Tensor,
+            query: torch.Tensor,
+            key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = positions.size(0)
-        cos_sin = self.cos_sin_cache[positions]
+        cos_sin = self.cos_sin_cache[positions]  # [T, d_model]
         cos, sin = cos_sin.chunk(2, dim=-1)
+
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
+        query = query.view(num_tokens, -1, self.head_size)  # [T, -1, d_model]
         query = apply_rotary_emb(query, cos, sin).view(query_shape)
+
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
         key = apply_rotary_emb(key, cos, sin).view(key_shape)
+
         return query, key
 
 
-@lru_cache(1)
+@lru_cache(1)  # 确保全局只有一个 RotaryEmbedding 对象，避免重复创建
 def get_rope(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: float,
-    rope_scaling: dict | None = None,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict | None = None,
 ):
     assert rope_scaling is None
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
