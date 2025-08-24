@@ -21,6 +21,13 @@ def store_kvcache_kernel(
         slot_mapping_ptr,
         D: tl.constexpr,  # 每个 token 的向量总长度
 ):
+
+    # `allocate_kv_cache`函数那里，分配真正的物理显存 [num_blocks, block_size, num_kv_heads, head_dim]
+    # 对应于这里的[num_blocks, block_size, D]的view
+    # 而slot_mapping能提供slot_id
+    # num_slots = num_blocks * block_size
+    # D = num_kv_heads * head_dim
+
     idx = tl.program_id(0)
     key_offsets = idx * key_stride + tl.arange(0, D)
     value_offsets = idx * value_stride + tl.arange(0, D)
@@ -49,12 +56,13 @@ def store_kvcache(key: torch.Tensor,
     assert key.stride(-1) == 1 and value.stride(-1) == 1  # 最后一维连续存放，如果不连续，Triton kernel tl.arange(0, D) 这种连续 load 就不成立
     # 在第1维（head）上走一步，要跨过 head_dim 个元素
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    # k_cache 的形状应该是 (num_slots, D)
+    # k_cache 的形状应该是 [num_blocks, block_size, num_kv_heads, head_dim]
     # 要求在第1维走一步（下一个 slot），必须跨过 D 个元素
     # 每个 slot 就是一个完整的 [num_heads × head_dim] 连续块。
     assert k_cache.stride(1) == D and v_cache.stride(1) == D
     assert slot_mapping.numel() == N
     # 并行处理N个token
+    # key.stride(0) = D
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -83,7 +91,6 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
 
         if k_cache.numel() and v_cache.numel():
-            # 如果已经有缓存，新的 k/v 会被写到 cache 中
             # slot_mapping 决定写入的位置
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
