@@ -5,6 +5,15 @@ import numpy as np
 from nanovllm.engine.sequence import Sequence
 
 
+# 内存浪费：如果每个序列长度不一样，那要 padding 到相同长度，很多位置其实没用到。
+# 访存效率低：不同样本的 KV cache 在内存里可能是碎片化的，做 attention 时很难高效地读。
+# 扩展困难：推理过程中，batch 会动态变化（有的序列结束了，有的新序列进来），必须有一种灵活的“映射表”来管理。
+#
+# 于是引入了 block-sparse KV cache 的概念：
+# 把 KV cache 组织成 固定大小的 block（比如 16 或 32 个 token 一块）。
+# 每个序列对应哪些 block，不用连续存，而是通过一个表来查。
+# 这样就能像查“索引表”一样，快速定位到对应的 KV 内存块。
+
 class Block:
 
     def __init__(self, block_id):

@@ -129,7 +129,9 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         # 对齐成相同长度的二维表（缺省填 -1），转到 GPU
-        # [B, max_blocks]
+        # [B, max_blocks_per_seq]
+        # 每一行对应一个序列，存放它的 KV cache 使用了哪些 block。
+        # 值是 block 在全局 KV 缓存里的索引。
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -157,7 +159,7 @@ class ModelRunner:
             if not seq.block_table:
                 continue
 
-            # slot_mapping: 对“尚未缓存”的块，按 block_table[i]*block_size + offset 计算精确写入地址。
+            # slot_mapping: 对“尚未缓存”的块，按 block_table[i]*block_size + offset 计算精确写入全局kv地址。
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
