@@ -1,0 +1,2 @@
+https://lightning.ai/docs/pytorch/stable/advanced/model_parallel/tp.html
+

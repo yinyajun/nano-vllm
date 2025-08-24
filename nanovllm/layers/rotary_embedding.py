@@ -31,7 +31,7 @@ class RotaryEmbedding(nn.Module):
         assert rotary_dim == head_size
         f = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
-        angles = torch.einsum("i,j -> ij", t, f)  # torch.outer(t, f) [max_len, d_model//2]
+        angles = torch.einsum("i,j -> ij", t, f)  # [max_len, d_model//2]
 
         cos = angles.cos()
         sin = angles.sin()

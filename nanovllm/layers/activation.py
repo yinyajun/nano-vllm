@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 
 class SiluAndMul(nn.Module):
+    # SwiGLU = silu(x * W_gate) \odot (x * W_up)
 
     def __init__(self):
         super().__init__()

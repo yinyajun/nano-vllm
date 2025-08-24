@@ -66,7 +66,7 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)  # 对head做norm
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
@@ -74,22 +74,22 @@ class Qwen3Attention(nn.Module):
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states) # [-1, q_size + 2 * kv_size]
+        qkv = self.qkv_proj(hidden_states)  # [-1, (q_size + 2 * kv_size) / tp_size]
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # 对 Q/K 做 RMSNorm，可以让每个 head 的激活量纲一致，避免“强头”过分影响注意力分布。
         # 这样 Q 与 K/V 的交互主要取决于 方向（语义差异），而不是大小（尺度偏移）。
-        q_by_head = q.view(-1, self.num_heads, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
+        q_by_head = q.view(-1, self.num_heads, self.head_dim)  # num_heads已经分片
+        q_by_head = self.q_norm(q_by_head)  # 只作用于head_dim
         q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
+        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)  # num_kv_heads已经分片
+        k_by_head = self.k_norm(k_by_head)  # 只作用于head_dim
         k = k_by_head.view(k.shape)
 
         q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o)
+        o = self.attn(q, k, v)  # [-1, num_head * head_dim] num_heads已经分片
+        output = self.o_proj(o)  # 借助row-wise parallel最后完成计算，省一次通信
         return output
 
 
@@ -116,9 +116,11 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)  # [x * W_gate, x * W_up]
-        x = self.act_fn(gate_up)  # SwiGLU = silu(x * W_gate) \odot (x * W_up)
+        gate_up = self.gate_up_proj(x)  # [-1， 2 * intermediate_size/ tp_size]
+        x = self.act_fn(gate_up)
+        # column-wise 和 row-wise 一起使用
         x = self.down_proj(x)
+        # 借助row-wise parallel最后完成计算，省一次通信
         return x
 
 
@@ -198,7 +200,7 @@ class Qwen3Model(nn.Module):
             input_ids: torch.Tensor,
             positions: torch.Tensor,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids)  # [T, d_model]
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
